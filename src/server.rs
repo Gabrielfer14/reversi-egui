@@ -1,9 +1,7 @@
-use tokio_tungstenite::{tungstenite::protocol::Message, accept_async};
-use futures_util::stream::StreamExt;
-use futures_util::SinkExt;
+use tokio::{net::TcpListener, io::{self, AsyncWriteExt, AsyncBufReadExt}};
 use serde::{Serialize, Deserialize};
-use tokio::sync::{mpsc, Mutex};
 use std::sync::Arc;
+use tokio::sync::Mutex;  // Importe o Mutex de Tokio
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct GameState {
@@ -18,110 +16,114 @@ struct Move {
 }
 
 struct GameRoom {
-    players: Vec<mpsc::Sender<GameState>>,
     game_state: GameState,
-    player_count: usize,
     game_started: bool,
 }
 
 impl GameRoom {
     fn new() -> Self {
         GameRoom {
-            players: Vec::new(),
             game_state: GameState {
                 board: [[0; 8]; 8],
-                current_turn: 1,
+                current_turn: 1, // Começa com o jogador 1 (X)
             },
-            player_count: 0, // Nenhum jogador inicialmente
             game_started: false,
         }
     }
 
-    fn add_player(&mut self, player: mpsc::Sender<GameState>) {
-        self.players.push(player);
-        self.player_count += 1;
-    }
-
     fn update_game_state(&mut self, player_move: Move) {
-        // Verifica se a jogada é válida
+        println!("Jogada recebida: ({}, {})", player_move.row, player_move.col);
+
         if self.game_state.board[player_move.row][player_move.col] == 0 {
             self.game_state.board[player_move.row][player_move.col] = self.game_state.current_turn;
             self.game_state.current_turn *= -1; // Troca de turno
-        }
-    }
-
-    fn broadcast(&self) {
-        for player in &self.players {
-            let _ = player.send(self.game_state.clone());
+            println!("Tabuleiro atualizado: {:?}", self.game_state.board);
+        } else {
+            println!("Jogada inválida! A posição já está ocupada.");
         }
     }
 
     fn start_game(&mut self) {
-        // Inicia o jogo quando ambos os jogadores estiverem conectados
-        if self.player_count == 2 && !self.game_started {
+        if !self.game_started {
             self.game_started = true;
-            // Envia uma mensagem de "início de jogo" para ambos os jogadores
-            let start_message = "O jogo começou!";
-            for player in &self.players {
-                let _ = player.send(self.game_state.clone());
-            }
-            println!("{}", start_message); // Imprimir no servidor que o jogo começou
+            println!("O jogo começou!");
         }
+    }
+
+    fn get_game_state(&self) -> String {
+        let mut board_str = String::new();
+        for row in &self.game_state.board {
+            for &cell in row {
+                board_str.push_str(&format!("{} ", if cell == 1 { "X" } else if cell == -1 { "O" } else { "." }));
+            }
+            board_str.push_str("\n");
+        }
+        board_str.push_str(&format!("Vez do jogador: {}", if self.game_state.current_turn == 1 { "Jogador 1 (X)" } else { "Jogador 2 (O)" }));
+        board_str
+    }
+}
+
+async fn handle_client(stream: tokio::net::TcpStream, game_room: Arc<Mutex<GameRoom>>) {
+    let (reader, mut writer) = io::split(stream);
+    let mut reader = io::BufReader::new(reader);
+    let mut buffer = String::new();
+
+    // Enviar o estado inicial do jogo
+    {
+        let game_room_lock = game_room.lock().await;
+        let initial_message = serde_json::to_string(&game_room_lock.game_state).unwrap();
+        // Escreva para o stream após o lock ser liberado
+        let _ = writer.write_all(initial_message.as_bytes()).await;
+    }
+
+    loop {
+        // Exibir o estado atual do jogo no Telnet
+        let game_state_str = {
+            let game_room_lock = game_room.lock().await;
+            game_room_lock.get_game_state()
+        };
+        // Escreva o estado do jogo para o stream
+        let _ = writer.write_all(game_state_str.as_bytes()).await;
+
+        // Esperar pela jogada do jogador
+        buffer.clear();
+        if let Err(_) = reader.read_line(&mut buffer).await {
+            break;
+        }
+
+        let parts: Vec<&str> = buffer.trim().split_whitespace().collect();
+        if parts.len() == 2 {
+            if let (Ok(row), Ok(col)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+                let player_move = Move { row, col };
+                let mut game_room_lock = game_room.lock().await;
+                game_room_lock.update_game_state(player_move);
+            }
+        }
+
+        // Verificar se o jogo já terminou ou se alguém venceu
+        // (Isso pode ser expandido para verificar o vencedor, etc.)
     }
 }
 
 #[tokio::main]
 async fn main() {
     let addr = "127.0.0.1:8080";
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = TcpListener::bind(addr).await.unwrap();
     println!("Servidor iniciado na porta 8080");
 
-    // Usar Arc<Mutex> para compartilhar o estado do jogo entre threads
-    let game_room = Arc::new(Mutex::new(GameRoom::new()));
+    let game_room = Arc::new(Mutex::new(GameRoom::new()));  // Use Arc<Mutex<GameRoom>>
 
     while let Ok((stream, _)) = listener.accept().await {
-        // Criar um canal para cada jogador
-        let (tx, _rx) = mpsc::channel(1);
+        let game_room_clone = Arc::clone(&game_room);  // Clonamos o Arc, não movemos o valor
 
-        // Clonar o Arc para passar para a thread
-        let game_room_clone = game_room.clone();
         tokio::spawn(async move {
-            let mut ws_stream = accept_async(stream)
-                .await
-                .expect("Erro ao aceitar a conexão");
             println!("Novo cliente conectado");
 
-            // Enviar estado inicial do jogo
-            let game_room = game_room_clone.lock().await;
-            let initial_state = game_room.game_state.clone();
-            let initial_message = serde_json::to_string(&initial_state).unwrap();
-            let _ = ws_stream.send(Message::Text(initial_message)).await;
+            let mut game_room_lock = game_room_clone.lock().await;
+            game_room_lock.start_game();
 
-            // Esperar o segundo jogador se conectar e iniciar o jogo
-            let mut game_room = game_room_clone.lock().await;
-            game_room.start_game(); // Verifica se o segundo jogador está presente
-
-            // Receber e processar mensagens dos jogadores
-            while let Some(Ok(msg)) = ws_stream.next().await {
-                if let Message::Text(msg_text) = msg {
-                    let player_move: Move = serde_json::from_str(&msg_text).unwrap();
-
-                    // Atualizar o estado do jogo com a jogada
-                    let mut game_room = game_room_clone.lock().await;
-                    game_room.update_game_state(player_move);
-                    game_room.broadcast(); // Enviar a atualização para os outros jogadores
-                }
-            }
+            drop(game_room_lock); // Drop the lock before calling handle_client
+            handle_client(stream, game_room_clone).await;
         });
-
-        // Adiciona o jogador à sala de jogo
-        let mut game_room = game_room.lock().await;
-        game_room.add_player(tx);
-
-        // Imprimir a quantidade de jogadores conectados
-        println!("Clientes conectados: {}", game_room.player_count);
-
-        // Caso já haja 2 jogadores, inicie o jogo
-        game_room.start_game();
     }
 }

@@ -1,14 +1,11 @@
-use eframe::egui;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};  // Corrigido aqui
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use futures_util::stream::StreamExt;
-use futures_util::SinkExt;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::protocol::Message;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Serialize, Deserialize};
-use tokio::sync::Mutex;
-use std::sync::Arc;
+use std::io::{self, Write};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]  // Clonando GameState
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct GameState {
     board: [[i32; 8]; 8],
     current_turn: i32,
@@ -17,19 +14,7 @@ struct GameState {
 struct ReversiGame {
     board: [[i32; 8]; 8],
     current_turn: i32,
-    server_url: String,
-    ws_stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,  // Tipo mais genérico
-}
-
-impl Clone for ReversiGame {
-    fn clone(&self) -> Self {
-        ReversiGame {
-            board: self.board,
-            current_turn: self.current_turn,
-            server_url: self.server_url.clone(),
-            ws_stream: None,  // Não clonamos a conexão WebSocket
-        }
-    }
+    ws_stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
 }
 
 impl ReversiGame {
@@ -37,109 +22,112 @@ impl ReversiGame {
         ReversiGame {
             board: [[0; 8]; 8],
             current_turn: 1,
-            server_url: "ws://127.0.0.1:8080".to_string(),
             ws_stream: None,
         }
     }
 
-    async fn connect_to_server(&mut self) {
-        let (ws_stream, _) = connect_async(&self.server_url).await.unwrap();
-        println!("Conectado ao servidor");
-
-        self.ws_stream = Some(ws_stream);
+    async fn connect_to_server(&mut self, server_url: &str) {
+        match connect_async(server_url).await {
+            Ok((ws_stream, _)) => {
+                println!("Conectado ao servidor");
+                self.ws_stream = Some(ws_stream);
+            },
+            Err(e) => {
+                println!("Erro ao conectar ao servidor: {}", e);
+            }
+        }
     }
 
-    async fn make_move(client: Arc<Mutex<ReversiGame>>, row: usize, col: usize) {
-        let mut app = client.lock().await;
-        if app.board[row][col] == 0 {
-            // Atualizar o tabuleiro localmente
-            app.board[row][col] = app.current_turn;
-            app.current_turn *= -1; // Alternar turno
+    async fn send_move(&mut self, row: usize, col: usize) {
+        if self.board[row][col] == 0 {
+            self.board[row][col] = self.current_turn;
+            self.current_turn *= -1;
 
-            // Enviar a jogada para o servidor
             let state = GameState {
-                board: app.board,
-                current_turn: app.current_turn,
+                board: self.board,
+                current_turn: self.current_turn,
             };
 
-            if let Some(ws_stream) = &mut app.ws_stream {
+            if let Some(ws_stream) = &mut self.ws_stream {
                 let msg = serde_json::to_string(&state).unwrap();
-                let _ = ws_stream.send(Message::Text(msg)).await;
+                if let Err(e) = ws_stream.send(Message::Text(msg)).await {
+                    println!("Erro ao enviar mensagem: {}", e);
+                }
             }
         }
     }
 
-    fn draw_board(&mut self, ctx: &egui::Context, client: Arc<Mutex<ReversiGame>>) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                for row in 0..8 {
-                    ui.vertical(|ui| {
-                        for col in 0..8 {
-                            let button = ui.add(egui::Button::new(format!("{}", self.board[row][col])));
-                            if button.clicked() {
-                                // Realizar o movimento ao clicar no botão
-                                let client_clone = client.clone();
-                                tokio::spawn(async move {
-                                    ReversiGame::make_move(client_clone, row, col).await;
-                                });
-                            }
-                        }
-                    });
-                }
-            });
-        });
-    }
-
-    async fn update_game_state(&mut self) {
-        // Receber e processar mensagens do servidor
+    async fn receive_game_state(&mut self) {
         if let Some(ws_stream) = &mut self.ws_stream {
+            let mut game_state: Option<GameState> = None; // Armazenar o estado do jogo temporariamente
+    
+            // Ler a mensagem e processar
             while let Some(Ok(msg)) = ws_stream.next().await {
                 if let Message::Text(msg_text) = msg {
-                    let game_state: GameState = serde_json::from_str(&msg_text).unwrap();
-                    println!("Estado do jogo recebido: {:?}", game_state);
-                    // Atualizar o estado do jogo
-                    self.board = game_state.board;
-                    self.current_turn = game_state.current_turn;
+                    game_state = Some(serde_json::from_str(&msg_text).unwrap());
                 }
+            }
+    
+            // Quando o loop terminar, usamos o estado do jogo se foi recebido
+            if let Some(state) = game_state {
+                self.board = state.board;
+                self.current_turn = state.current_turn;
+                self.print_board(); // Atualiza o tabuleiro no cliente
             }
         }
     }
-}
-
-impl eframe::App for ReversiGame {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let client = Arc::new(Mutex::new(self.clone()));
-        self.draw_board(ctx, client.clone());
-
-        // Atualizar o estado do jogo a partir do servidor
-        tokio::spawn(async move {
-            let mut app = client.lock().await;
-            app.update_game_state().await;
-        });
+    
+    fn print_board(&self) {
+        println!("Estado atual do jogo:");
+        for row in 0..8 {
+            for col in 0..8 {
+                let symbol = match self.board[row][col] {
+                    1 => "X",
+                    -1 => "O",
+                    _ => ".",
+                };
+                print!("{} ", symbol);
+            }
+            println!();
+        }
+        println!("Vez do jogador: {}", if self.current_turn == 1 { "X" } else { "O" });
     }
 
-    fn on_exit(&mut self, _ctx: &eframe::glow::Context) {
-        println!("Saindo do jogo...");
+    fn prompt_move(&self) -> (usize, usize) {
+        loop {
+            print!("Digite sua jogada (linha e coluna): ");
+            io::stdout().flush().unwrap();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+            let parts: Vec<&str> = input.trim().split_whitespace().collect();
+            if parts.len() == 2 {
+                if let (Ok(row), Ok(col)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+                    if row < 8 && col < 8 && self.board[row][col] == 0 {
+                        return (row, col);
+                    }
+                }
+            }
+            println!("Entrada inválida. Tente novamente.");
+        }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let app = Arc::new(Mutex::new(ReversiGame::new()));
-    let client = app.clone();
+    let mut game = ReversiGame::new();
 
-    // Conectar ao servidor em segundo plano
-    let client_clone = client.clone();
-    tokio::spawn(async move {
-        let mut app = client.lock().await;
-        app.connect_to_server().await;
-    });
+    // Conectar ao servidor
+    game.connect_to_server("ws://127.0.0.1:8080").await;
 
-    eframe::run_native(
-        "Reversi Game",
-        eframe::NativeOptions::default(),
-        Box::new(move |_cc| {
-            Box::new(ReversiGame::new())
-        }),
-    );
+    loop {
+        // Exibir o tabuleiro e perguntar pela jogada
+        game.print_board();
+        let (row, col) = game.prompt_move();
+
+        // Enviar a jogada para o servidor
+        game.send_move(row, col).await;
+
+        // Receber e exibir o estado atualizado do jogo
+        game.receive_game_state().await;
+    }
 }
